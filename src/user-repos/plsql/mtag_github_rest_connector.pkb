@@ -1,14 +1,12 @@
-create or replace package body mtag_user_repos_connector
+create or replace package body mtag_github_rest_connector
 as
 
+  gc_scope constant varchar2(129) := $$plsql_unit || '.';
+
   gc_per_page_param_name   varchar2(8) := 'per_page';
-  gc_per_page_default      pls_integer := 20;
+  gc_per_page_maximum      pls_integer := 20;
   gc_page_param_name       varchar2(4) := 'page';
   gc_link_header_name      varchar2(4) := 'Link';
-
-  -- If you want to debug use true
-  -- forces apex_debug to always be written
-  gc_always_log            boolean     := true;
 
   type t_pagination_info is
     record
@@ -20,19 +18,6 @@ as
     , row_count         number          := 0
     );
 
-  procedure quick_log
-  (
-    p_message in varchar2
-  )
-  as
-    pragma autonomous_transaction;
-  begin
-    insert into quick_log
-      values ( systimestamp, p_message )
-    ;
-    commit;
-  end quick_log;
-
   function get_row_count
   (
     p_response in clob
@@ -40,7 +25,7 @@ as
   as
     l_return number;
   begin
-    quick_log( 'Enter get_row_count' );
+    apex_debug.enter( p_routine_name => gc_scope || 'get_row_count' );
 
     select count(*)
       into l_return
@@ -54,7 +39,7 @@ as
                      )
     ;
 
-    quick_log( 'Exit get_row_count: ' || l_return );
+    apex_debug.trace( p_message => 'Exit get_row_count. return=%s ', p0 => l_return );
     return l_return;
   end get_row_count;
 
@@ -71,10 +56,11 @@ as
     l_link_header_parts apex_t_varchar2;
     l_cur_header_parts  apex_t_varchar2;
   begin
+    apex_debug.enter( p_routine_name => gc_scope || 'pagination_info' );
 
     for i in 1 .. p_response_headers.count loop
       if p_response_headers( i ).name = gc_link_header_name then
-        quick_log( 'Found link header' );
+        apex_debug.message( p_message => 'Found link header. Value=%s', p0 => p_response_headers( i ).value );
         l_link_header_value := p_response_headers( i ).value;
         l_link_header_found := true;
       end if;
@@ -87,11 +73,11 @@ as
         l_cur_header_parts := apex_string.split( p_str => l_link_header_parts( i ), p_sep => ';' );
         case trim( both from l_cur_header_parts( 2 ) )
           when 'rel="prev"' then
-            quick_log( 'Found prev link' );
+            apex_debug.message( p_message => 'Found prev link. Value=%s', p0 => regexp_replace( l_cur_header_parts( 1 ), '.*\?(\S*)>.*', '\1' ) );
             p_pagination_info.prev_query_string := regexp_replace( l_cur_header_parts( 1 ), '.*\?(\S*)>.*', '\1' );
             p_pagination_info.has_prev_page     := true;
           when 'rel="next"' then
-            quick_log( 'Found next link' );
+            apex_debug.message( p_message => 'Found next link. Value=%s', p0 => regexp_replace( l_cur_header_parts( 1 ), '.*\?(\S*)>.*', '\1' ) );
             p_pagination_info.next_query_string := regexp_replace( l_cur_header_parts( 1 ), '.*\?(\S*)>.*', '\1' );
             p_pagination_info.has_next_page     := true;
           else
@@ -102,6 +88,7 @@ as
 
     p_pagination_info.row_count := get_row_count( p_response => p_response );
 
+    apex_debug.trace( p_message => 'End pagination_info' );
   end pagination_info;
 
   procedure capabilities_web_source
@@ -112,10 +99,10 @@ as
   as
   begin
     -- Github User Repos has capabilities for
-    -- Pagination and Sorting.
-    -- In theory also fitering, but we'll leave this out for now.
+    -- Pagination and Sorting and Filtering.
+    -- We will only enable Pagination for now.
     p_result.pagination := true;
-    p_result.order_by   := true;
+    p_result.order_by   := false;
     p_result.filtering  := false;
   end capabilities_web_source;
 
@@ -129,7 +116,6 @@ as
   as
     l_web_source_operation apex_plugin.t_web_source_operation;
     l_time_budget          number;
-    l_page_id              pls_integer;
     l_start_page_id        pls_integer;
     l_continue_fetch       boolean     := true;
     l_page_to_fetch        pls_integer := 0;
@@ -141,6 +127,7 @@ as
     l_response_row_count   pls_integer := 0;
     l_pagination_size      pls_integer;
   begin
+    apex_debug.enter( p_routine_name => gc_scope || 'fetch_web_source' );
 
     apex_plugin_util.debug_web_source
     (
@@ -156,16 +143,16 @@ as
       , p_perform_init => true
       );
 
-    quick_log( 'Original Query String is: ' || l_web_source_operation.query_string );
+    apex_debug.info( p_message => 'Original Query String is: %s', p0 => l_web_source_operation.query_string );
 
-    l_page_size    := coalesce( p_params.fixed_page_size, gc_per_page_default );
+    l_page_size    := coalesce( p_params.fixed_page_size, gc_per_page_maximum );
     l_query_string := l_web_source_operation.query_string;
 
     p_result.responses := apex_t_clob();
 
     l_pagination_size :=
       case when p_params.fetch_all_rows then 100
-           else least( coalesce( p_params.max_rows, gc_per_page_default ), gc_per_page_default )
+           else least( coalesce( p_params.max_rows, gc_per_page_maximum ), gc_per_page_maximum )
       end;
 
     l_start_page_id :=
@@ -173,25 +160,24 @@ as
            else floor( ( p_params.first_row - 1 ) / l_pagination_size ) + 1
       end;
 
-    l_page_id := l_start_page_id;
-
     while l_continue_fetch and coalesce( l_time_budget, 1 ) > 0 loop
       p_result.responses.extend( 1 );
       l_page_to_fetch := l_page_to_fetch + 1;
 
-      -- on first fetch we do not have any pagination info
+      -- On first fetch we do not have any pagination info
+      -- Therefore setting query string with pagination size and start page
       if l_pagination_info.next_query_string is null then
         l_web_source_operation.query_string :=
           l_query_string || gc_per_page_param_name || '=' || l_pagination_size || '&'
-                         || gc_page_param_name || '=' || l_page_id
+                         || gc_page_param_name || '=' || l_start_page_id
         ;
       else
-        -- if pagination info received we get full query string already
+        -- if pagination info received we get full query string already.
         -- Github gives us this in the result headers, so using it instead of building on our own
         l_web_source_operation.query_string := l_query_string;
       end if;
 
-      quick_log( 'New Query String is: ' || l_web_source_operation.query_string );
+      apex_debug.info( p_message => 'New Query String is: %s', p0 => l_web_source_operation.query_string );
 
       apex_plugin_util.make_rest_request
       (
@@ -209,13 +195,15 @@ as
       , p_pagination_info  => l_pagination_info
       );
 
+      -- For every page we add derived row count to total row count
       l_response_row_count := l_response_row_count + l_pagination_info.row_count;
 
       l_continue_fetch := p_params.fetch_all_rows and l_pagination_info.has_next_page;
 
       if l_continue_fetch then
+        -- Github hands back prev/next links in a header variable
+        -- We already extracted it and derived the next link
         l_query_string := l_pagination_info.next_query_string;
-        l_page_id      := l_page_id + 1;
       end if;
 
     end loop;
@@ -228,7 +216,7 @@ as
       p_result.response_first_row := 1;
     else
       p_result.has_more_rows      := l_pagination_info.has_next_page;
-      p_result.response_first_row := ( l_start_page_id -1 ) * l_page_size + 1;
+      p_result.response_first_row := ( l_start_page_id - 1 ) * l_page_size + 1;
     end if;
 
     -- Derived by counting array in response
@@ -238,10 +226,10 @@ as
 
   procedure discover
   (
-    p_plugin         in            wwv_flow_plugin_api.t_plugin
-  , p_web_source     in            wwv_flow_plugin_api.t_web_source
-  , p_params         in            wwv_flow_plugin_api.t_web_source_discover_params
-  , p_result         in out nocopy wwv_flow_plugin_api.t_web_source_discover_result
+    p_plugin         in            apex_plugin.t_plugin
+  , p_web_source     in            apex_plugin.t_web_source
+  , p_params         in            apex_plugin.t_web_source_discover_params
+  , p_result         in out nocopy apex_plugin.t_web_source_discover_result
   )
   as
     l_web_source_operation          apex_plugin.t_web_source_operation;
@@ -249,11 +237,12 @@ as
     l_dummy_parameters              apex_plugin.t_web_source_parameters;
 
     -- Using 20 result per page as default
-    l_per_page_value        pls_integer := gc_per_page_default;
+    l_per_page_value        pls_integer := gc_per_page_maximum;
     l_per_page_found        boolean     := false;
     l_per_page_idx          pls_integer;
     l_time_budget           number;
   begin
+
     l_web_source_operation :=
       apex_plugin_util.get_web_source_operation
       (
@@ -290,8 +279,7 @@ as
     p_result.response_headers := apex_web_service.g_headers;
     p_result.parameters       := l_in_parameters;
 
-    null;
   end discover;
 
-end mtag_user_repos_connector;
+end mtag_github_rest_connector;
 /
